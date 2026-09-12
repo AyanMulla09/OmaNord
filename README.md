@@ -70,6 +70,19 @@ omarchy plugin enable ayan.nordvpn
 omarchy bar move ayan.nordvpn --section right
 ```
 
+## Uninstall
+
+```bash
+omarchy plugin remove ayan.nordvpn --yes
+```
+
+Or by hand: remove it from the bar in `~/.config/omarchy/shell.json`, delete
+`~/.config/omarchy/plugins/ayan.nordvpn`, then `omarchy-shell shell
+rescanPlugins`. This only removes the widget itself — it never touches your
+NordVPN login, connection, or CLI settings, and your favorites/recents file
+at `~/.local/state/omarchy-nordvpn/prefs.json` is left in place in case you
+reinstall later (delete it too if you want a completely clean slate).
+
 ## Options
 
 Set on the widget's entry in `~/.config/omarchy/shell.json`:
