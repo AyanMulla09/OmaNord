@@ -26,6 +26,75 @@ Panel {
   property bool hasCli: true
   property bool busy: false
   property string busyLabel: ""
+
+  // --------------------------------------------------- trusted execution ----
+  // Every external program is invoked by its absolute, package-owned path so
+  // a shadowed/earlier PATH entry can never be picked up instead — these are
+  // the paths `nordvpn`/`sh`/etc. actually resolve to on an Omarchy (Arch)
+  // install, hardcoded rather than looked up through the inherited PATH.
+  readonly property string binSh: "/usr/bin/sh"
+  readonly property string binBash: "/usr/bin/bash"
+  readonly property string binNordvpn: "/usr/bin/nordvpn"
+  readonly property string binPkexec: "/usr/bin/pkexec"
+  readonly property string binSystemctl: "/usr/bin/systemctl"
+  readonly property string binUsermod: "/usr/bin/usermod"
+  readonly property string binPing: "/usr/bin/ping"
+  readonly property string binWlCopy: "/usr/bin/wl-copy"
+  readonly property string binLaunchBrowser: "/usr/bin/omarchy-launch-browser"
+
+  // Minimal env for plain CLI helpers: just enough for them to find $HOME and
+  // resolve any command they shell out to internally, nothing inherited from
+  // this process that they don't need.
+  readonly property var minimalEnv: ({
+    "HOME": Quickshell.env("HOME") || "",
+    "USER": Quickshell.env("USER") || Quickshell.env("LOGNAME") || "",
+    "PATH": "/usr/bin"
+  })
+  // pkexec needs to reach the session's polkit authentication agent over the
+  // session bus, and wl-copy needs the Wayland socket — both otherwise absent
+  // from minimalEnv.
+  readonly property var sessionEnv: {
+    var e = {};
+    for (var k in root.minimalEnv) e[k] = root.minimalEnv[k];
+    e["XDG_RUNTIME_DIR"] = Quickshell.env("XDG_RUNTIME_DIR") || "";
+    e["DBUS_SESSION_BUS_ADDRESS"] = Quickshell.env("DBUS_SESSION_BUS_ADDRESS") || "";
+    e["WAYLAND_DISPLAY"] = Quickshell.env("WAYLAND_DISPLAY") || "";
+    return e;
+  }
+
+  // Bounds a Process's lifetime: SIGTERM after `termMs` of running, SIGKILL
+  // after a further `killMs` if it ignored that. Without this a shadowed or
+  // wedged CLI standing in for `nordvpn`/etc. would run — and hold its
+  // StdioCollector output — forever, since none of these processes otherwise
+  // have any timeout of their own.
+  component ProcGuard: Item {
+    id: guard
+    property Process target
+    property int termMs: 8000
+    property int killMs: 3000
+    readonly property bool targetRunning: target ? target.running : false
+    onTargetRunningChanged: {
+      if (targetRunning) termTimer.restart();
+      else { termTimer.stop(); killTimer.stop(); }
+    }
+    Timer {
+      id: termTimer
+      interval: guard.termMs
+      repeat: false
+      onTriggered: {
+        if (guard.target && guard.target.running) {
+          guard.target.signal(15);
+          killTimer.restart();
+        }
+      }
+    }
+    Timer {
+      id: killTimer
+      interval: guard.killMs
+      repeat: false
+      onTriggered: { if (guard.target && guard.target.running) guard.target.signal(9); }
+    }
+  }
   property string tab: "map"
   property string hoverName: ""
   property string hoverMeta: ""
@@ -61,9 +130,9 @@ Panel {
   // more private default) and is a harmless no-op if the prompt doesn't
   // come up (already answered on a prior run).
   function runLogin(extraArgs) {
-    var argv = ["nordvpn", "login"].concat(extraArgs || []);
+    var argv = [root.binNordvpn, "login"].concat(extraArgs || []);
     var quoted = argv.map(function (a) { return root.shQuote(a); }).join(" ");
-    loginProc.command = ["bash", "-c", "printf 'n\\n' | " + quoted];
+    loginProc.command = [root.binBash, "-c", "printf 'n\\n' | " + quoted];
     loginProc.running = true;
   }
 
@@ -117,7 +186,7 @@ Panel {
     loginUrlOpened = true;
     loginUrlTimeoutTimer.stop();
     loginStatusText = "Waiting for you to finish in the browser…";
-    Quickshell.execDetached(["omarchy-launch-browser", loginUrl]);
+    Quickshell.execDetached({ command: [root.binLaunchBrowser, loginUrl] });
     loginPollTimer.restart();
   }
 
@@ -199,7 +268,7 @@ Panel {
   }
 
   function copyText(s) {
-    copyProc.command = ["sh", "-c", "printf '%s' " + shQuote(s) + " | wl-copy"];
+    copyProc.command = [root.binSh, "-c", "printf '%s' " + shQuote(s) + " | " + root.binWlCopy];
     copyProc.running = true;
     showToast("Copied to clipboard");
   }
@@ -221,7 +290,7 @@ Panel {
     if (busy) return;
     busy = true;
     busyLabel = label;
-    actionProc.command = ["nordvpn"].concat(args);
+    actionProc.command = [root.binNordvpn].concat(args);
     actionProc.running = true;
   }
 
@@ -309,15 +378,45 @@ Panel {
     onLoadFailed: function (err) { console.warn("ayan.nordvpn: world-paths.json load failed", err); }
   }
 
+  // The prefs directory is validated once (created 0700, refused if it turns
+  // out to be a symlink someone planted to redirect the write elsewhere)
+  // before anything is ever written into it. The actual write then goes
+  // through FileView's atomicWrites, which writes a randomized temp file in
+  // that directory and renames it over prefs.json — rename(2) never follows
+  // a symlink at the destination, so once the directory itself is known-good
+  // the write is safe by construction.
+  readonly property string prefsDir: (Quickshell.env("HOME") || "") + "/.local/state/omarchy-nordvpn"
+  readonly property string prefsPath: root.prefsDir + "/prefs.json"
+  property bool prefsDirReady: false
+  property bool _prefsWritePending: false
+
+  function ensurePrefsDir() {
+    if (root.prefsDirReady || dirSetupProc.running) return;
+    var home = Quickshell.env("HOME") || "";
+    var dir = root.shQuote(root.prefsDir);
+    var script =
+      "umask 077; " +
+      "mkdir -p " + root.shQuote(home + "/.local/state") + " || exit 1; " +
+      "if [ -e " + dir + " ] && [ -L " + dir + " ]; then exit 1; fi; " +
+      "mkdir " + dir + " 2>/dev/null; " +
+      "[ -d " + dir + " ] && [ ! -L " + dir + " ]";
+    dirSetupProc.command = [root.binSh, "-c", script];
+    dirSetupProc.running = true;
+  }
+
   function persistPrefs() {
+    if (!root.prefsDirReady) {
+      root._prefsWritePending = true;
+      root.ensurePrefsDir();
+      return;
+    }
+    root.writePrefsNow();
+  }
+
+  function writePrefsNow() {
     // Never let a write failure bubble into a caller (e.g. connectCountry).
     try {
-      var json = JSON.stringify({ favorites: favorites, recents: recents });
-      var q = "'" + json.replace(/'/g, "'\\''") + "'";
-      prefsWriteProc.command = ["sh", "-c",
-        "mkdir -p \"$HOME/.local/state/omarchy-nordvpn\" && printf '%s' " + q +
-        " > \"$HOME/.local/state/omarchy-nordvpn/prefs.json\""];
-      prefsWriteProc.running = true;
+      prefsWriter.setText(JSON.stringify({ favorites: favorites, recents: recents }));
     } catch (e) {
       console.warn("ayan.nordvpn: could not persist prefs", e);
     }
@@ -327,6 +426,7 @@ Panel {
     countriesFile.reload();
     worldFile.reload();
     cliProbe.running = true;
+    ensurePrefsDir();
     refreshStatus();
   }
 
@@ -337,20 +437,25 @@ Panel {
   // ------------------------------------------------------------ procs -----
   Process {
     id: statusProc
-    command: ["nordvpn", "status"]
+    command: [root.binNordvpn, "status"]
+    clearEnvironment: true
+    environment: root.minimalEnv
     stdout: StdioCollector { id: statusOut; waitForEnd: true }
     stderr: StdioCollector { id: statusErr; waitForEnd: true }
     onExited: function (code) {
       root.applyStatus((statusOut.text || "") + "\n" + (statusErr.text || ""), code === 0);
     }
   }
+  ProcGuard { target: statusProc; termMs: 6000; killMs: 2000 }
 
   // `nordvpn status` never mentions login state (logged-out just reads
   // "Status: Disconnected") — `nordvpn account` is the one command that
   // actually says "You're not logged in.", so login detection runs off this.
   Process {
     id: accountProc
-    command: ["nordvpn", "account"]
+    command: [root.binNordvpn, "account"]
+    clearEnvironment: true
+    environment: root.minimalEnv
     stdout: StdioCollector { id: accountOut; waitForEnd: true }
     stderr: StdioCollector { id: accountErr; waitForEnd: true }
     onExited: {
@@ -358,9 +463,12 @@ Panel {
       root.loggedIn = !/not logged in/i.test(raw);
     }
   }
+  ProcGuard { target: accountProc; termMs: 6000; killMs: 2000 }
 
   Process {
     id: actionProc
+    clearEnvironment: true
+    environment: root.minimalEnv
     stdout: StdioCollector { id: actionOut; waitForEnd: true }
     stderr: StdioCollector { id: actionErr; waitForEnd: true }
     onExited: function () {
@@ -371,15 +479,49 @@ Panel {
       settleTimer.restart();
     }
   }
+  ProcGuard { target: actionProc; termMs: 20000; killMs: 3000 }
 
-  Process { id: prefsWriteProc }
-  Process { id: copyProc }
+  Process {
+    id: copyProc
+    clearEnvironment: true
+    environment: root.sessionEnv
+  }
+  ProcGuard { target: copyProc; termMs: 5000; killMs: 2000 }
 
   Process {
     id: cliProbe
-    command: ["sh", "-c", "command -v nordvpn >/dev/null 2>&1 && echo yes || echo no"]
-    stdout: StdioCollector { id: cliProbeOut; waitForEnd: true }
-    onExited: root.hasCli = String(cliProbeOut.text || "").indexOf("yes") >= 0
+    command: [root.binSh, "-c", "[ -x " + root.shQuote(root.binNordvpn) + " ]"]
+    clearEnvironment: true
+    environment: root.minimalEnv
+    onExited: function (code) { root.hasCli = (code === 0); }
+  }
+  ProcGuard { target: cliProbe; termMs: 5000; killMs: 2000 }
+
+  // Validates/creates the private prefs directory (see ensurePrefsDir()).
+  Process {
+    id: dirSetupProc
+    clearEnvironment: true
+    environment: root.minimalEnv
+    onExited: function (code) {
+      root.prefsDirReady = (code === 0);
+      if (code !== 0) {
+        console.warn("ayan.nordvpn: refusing to use prefs dir (symlinked or could not be created)");
+        root._prefsWritePending = false;
+      } else if (root._prefsWritePending) {
+        root._prefsWritePending = false;
+        root.writePrefsNow();
+      }
+    }
+  }
+  ProcGuard { target: dirSetupProc; termMs: 5000; killMs: 2000 }
+
+  FileView {
+    id: prefsWriter
+    path: root.prefsPath
+    preload: false
+    printErrors: false
+    atomicWrites: true
+    onSaveFailed: function (err) { console.warn("ayan.nordvpn: could not persist prefs", err); }
   }
 
   // Privileged/system one-off fixes for the setup flow (start the daemon
@@ -388,6 +530,8 @@ Panel {
   // state, and a cancelled prompt doesn't get reported as a VPN error.
   Process {
     id: setupProc
+    clearEnvironment: true
+    environment: root.sessionEnv
     stdout: StdioCollector { id: setupOut; waitForEnd: true }
     stderr: StdioCollector { id: setupErr; waitForEnd: true }
     onExited: function (code) {
@@ -399,6 +543,10 @@ Panel {
       settleTimer.restart();
     }
   }
+  // pkexec blocks on the user entering their password in the polkit agent
+  // dialog, which can legitimately sit open for a while — give it much more
+  // rope than a plain CLI call before treating it as wedged.
+  ProcGuard { target: setupProc; termMs: 120000; killMs: 5000 }
 
   // `nordvpn login` prints "Continue in the browser: <url>" and then BLOCKS
   // until the browser round-trip completes (confirmed live: sometimes that's
@@ -409,6 +557,8 @@ Panel {
   // for success/failure text once it does finally exit.
   Process {
     id: loginProc
+    clearEnvironment: true
+    environment: root.minimalEnv
     stdout: SplitParser { onRead: function (line) { root.handleLoginOutput(line, false); } }
     stderr: SplitParser { onRead: function (line) { root.handleLoginOutput(line, true); } }
     onExited: function (code) {
@@ -433,6 +583,9 @@ Panel {
       // into "waiting for the browser" and started the poll — leave it be.
     }
   }
+  // The browser round-trip is user-paced; give it generous rope before
+  // assuming the process itself (not just the human) is stuck.
+  ProcGuard { target: loginProc; termMs: 300000; killMs: 5000 }
 
   // If no URL shows up at all within 12s (e.g. the daemon is unreachable, or
   // this version of the CLI changed its wording), stop looking like it's
@@ -473,12 +626,15 @@ Panel {
 
   Process {
     id: pingProc
+    clearEnvironment: true
+    environment: root.minimalEnv
     stdout: StdioCollector { id: pingOut; waitForEnd: true }
     onExited: function () {
       var m = String(pingOut.text || "").match(/time[=<]([\d.]+)\s*ms/i);
       root.latencyMs = m ? parseFloat(m[1]) : -1;
     }
   }
+  ProcGuard { target: pingProc; termMs: 5000; killMs: 2000 }
 
   // Poll cadence: relaxed when the panel is closed, snappier while it is open.
   Timer {
@@ -511,7 +667,7 @@ Panel {
     triggeredOnStart: true
     onTriggered: {
       if (pingProc.running) return;
-      pingProc.command = ["ping", "-n", "-c", "1", "-W", "1", root.status.ip];
+      pingProc.command = [root.binPing, "-n", "-c", "1", "-W", "1", root.status.ip];
       pingProc.running = true;
     }
   }
@@ -1051,10 +1207,10 @@ Panel {
             : "Start the NordVPN service"
         onClicked: {
           if (setup.blocker === "nogroup")
-            root.runSetupFix(["pkexec", "usermod", "-aG", "nordvpn", Quickshell.env("USER") || Quickshell.env("LOGNAME")],
+            root.runSetupFix([root.binPkexec, root.binUsermod, "-aG", "nordvpn", Quickshell.env("USER") || Quickshell.env("LOGNAME")],
                               "Adding you to the nordvpn group…");
           else
-            root.runSetupFix(["pkexec", "systemctl", "enable", "--now", "nordvpnd"],
+            root.runSetupFix([root.binPkexec, root.binSystemctl, "enable", "--now", "nordvpnd"],
                               "Starting the NordVPN service…");
         }
       }
@@ -1110,7 +1266,7 @@ Panel {
         }
         Row {
           spacing: Style.space(10)
-          PillButton { text: "Open in browser"; onClicked: Quickshell.execDetached(["omarchy-launch-browser", root.loginUrl]) }
+          PillButton { text: "Open in browser"; onClicked: Quickshell.execDetached({ command: [root.binLaunchBrowser, root.loginUrl] }) }
           CopyIconButton { value: root.loginUrl; anchors.verticalCenter: parent.verticalCenter }
         }
       }
