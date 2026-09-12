@@ -1,0 +1,4 @@
+# Local fetch caches for scripts/refresh-data.mjs (re-downloaded when absent)
+scripts/world.json
+scripts/nordcountries.json
+node_modules/

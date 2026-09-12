@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "ayan.nordvpn",
+  "name": "OmaNord",
+  "version": "1.0.0",
+  "author": "ayan",
+  "description": "NordVPN control: connection state, live network stats, and an interactive world map country picker. Adapts to the active Omarchy theme.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "OmaNord",
+    "description": "Connect, pick a country from a world map, and watch live throughput",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "quickConnectTarget": ""
+    },
+    "schema": [
+      { "key": "quickConnectTarget", "type": "string", "label": "Quick-connect target (blank = fastest; else country name or code)" }
+    ]
+  }
+}
