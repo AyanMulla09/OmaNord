@@ -95,6 +95,25 @@ Panel {
       onTriggered: { if (guard.target && guard.target.running) guard.target.signal(9); }
     }
   }
+
+  // ProcGuard bounds wall-clock time, not bytes: a fast (or malicious)
+  // producer standing in for `nordvpn`/etc. could still exhaust memory in
+  // StdioCollector well before a timeout fires. StdioCollector's `dataChanged`
+  // fires as each chunk of output arrives — unlike a line-based parser it
+  // isn't waiting on a delimiter, so this reacts immediately rather than
+  // buffering an unbounded "unterminated record". The instant accumulated
+  // output crosses the cap, the owning process is killed outright (SIGKILL,
+  // not just asked to stop) so no further output is produced.
+  readonly property int outputCapBytes: 65536
+  component OutputCap: Connections {
+    id: cap
+    property Process guarded
+    property int capBytes: root.outputCapBytes
+    function onDataChanged() {
+      if (target && target.text && target.text.length > cap.capBytes && cap.guarded && cap.guarded.running)
+        cap.guarded.signal(9);
+    }
+  }
   property string tab: "map"
   property string hoverName: ""
   property string hoverMeta: ""
@@ -120,6 +139,11 @@ Panel {
   property string loginUrl: ""
   property bool loginUrlOpened: false
   property string loginOutputBuf: ""
+  // Raw per-stream accumulation backing loginOutputBuf, each capped to
+  // outputCapBytes so neither this buffer nor the underlying collector can
+  // grow unbounded even if the process is never terminated in time.
+  property string _loginOutText: ""
+  property string _loginErrText: ""
 
   // A truly first-ever run of `nordvpn` on a machine (no prior config at
   // all — verified live right after a fresh install) shows a one-time
@@ -142,6 +166,8 @@ Panel {
     loginUrl = "";
     loginUrlOpened = false;
     loginOutputBuf = "";
+    root._loginOutText = "";
+    root._loginErrText = "";
     loginStatusText = "Opening nordvpn.com in your browser…";
     loginBusy = true;
     runLogin([]);
@@ -155,6 +181,8 @@ Panel {
     loginUrl = "";
     loginUrlOpened = true;   // already have a URL — don't try to relaunch a browser for it
     loginOutputBuf = "";
+    root._loginOutText = "";
+    root._loginErrText = "";
     loginStatusText = "Completing login…";
     loginBusy = true;
     runLogin(["--callback", url]);
@@ -167,6 +195,8 @@ Panel {
     loginUrl = "";
     loginUrlOpened = true;
     loginOutputBuf = "";
+    root._loginOutText = "";
+    root._loginErrText = "";
     loginStatusText = "Logging in with token…";
     loginBusy = true;
     runLogin(["--token", token]);
@@ -174,13 +204,18 @@ Panel {
 
   // `nordvpn login` prints its URL and then blocks — sometimes for as long as
   // the browser round-trip takes — so we can't wait for the process to exit
-  // before showing it. stdout/stderr are streamed line-by-line instead (see
-  // loginProc below) straight into this, matching the same shape of problem
-  // in ../panels/tailscale/Service.qml's handleLoginOutput/openAuthUrlFrom.
-  function handleLoginOutput(data, isError) {
-    loginOutputBuf += String(data || "") + "\n";
+  // before showing it. `text` is the *entire* cumulative content of one
+  // stream so far (from a live, not-yet-exited StdioCollector — see loginProc
+  // below), which is why it's stored (capped) rather than appended: it always
+  // replaces, never accumulates on top of, what we saw last time for that
+  // stream. Matches the same shape of problem in
+  // ../panels/tailscale/Service.qml's handleLoginOutput/openAuthUrlFrom.
+  function handleLoginOutput(text, isError) {
+    var capped = String(text || "").slice(-root.outputCapBytes);
+    if (isError) root._loginErrText = capped; else root._loginOutText = capped;
+    root.loginOutputBuf = root._loginOutText + "\n" + root._loginErrText;
     if (loginUrlOpened) return;
-    var m = String(data || "").match(/https?:\/\/\S+/);
+    var m = capped.match(/https?:\/\/\S+/);
     if (!m) return;
     loginUrl = m[0];
     loginUrlOpened = true;
@@ -378,45 +413,48 @@ Panel {
     onLoadFailed: function (err) { console.warn("ayan.nordvpn: world-paths.json load failed", err); }
   }
 
-  // The prefs directory is validated once (created 0700, refused if it turns
-  // out to be a symlink someone planted to redirect the write elsewhere)
-  // before anything is ever written into it. The actual write then goes
-  // through FileView's atomicWrites, which writes a randomized temp file in
-  // that directory and renames it over prefs.json — rename(2) never follows
-  // a symlink at the destination, so once the directory itself is known-good
-  // the write is safe by construction.
+  // Checking the state directory once and writing through a separately
+  // re-resolved path (e.g. a FileView) later leaves a gap: the pathname gets
+  // walked a second time, from scratch, at save time, so nothing ties that
+  // write back to the specific directory object that was actually validated
+  // — it could have been swapped for a symlink in between. Instead, the
+  // check and the write happen back-to-back inside one shell invocation:
+  // `cd` into the validated directory once, then do every subsequent
+  // operation (mktemp/write/rename) with a bare relative name. A process's
+  // working directory is bound to the directory's inode at the time of
+  // `cd`, not re-resolved from the path string afterwards, so this is the
+  // shell-level equivalent of holding an fd opened O_NOFOLLOW on that
+  // directory — later replacing "omarchy-nordvpn" on disk can't redirect
+  // operations this same script already `cd`-ed into. The write itself is
+  // still a randomized temp file + rename within that directory, so it's
+  // atomic and never follows a symlink at the destination name either.
   readonly property string prefsDir: (Quickshell.env("HOME") || "") + "/.local/state/omarchy-nordvpn"
   readonly property string prefsPath: root.prefsDir + "/prefs.json"
-  property bool prefsDirReady: false
-  property bool _prefsWritePending: false
-
-  function ensurePrefsDir() {
-    if (root.prefsDirReady || dirSetupProc.running) return;
-    var home = Quickshell.env("HOME") || "";
-    var dir = root.shQuote(root.prefsDir);
-    var script =
-      "umask 077; " +
-      "mkdir -p " + root.shQuote(home + "/.local/state") + " || exit 1; " +
-      "if [ -e " + dir + " ] && [ -L " + dir + " ]; then exit 1; fi; " +
-      "mkdir " + dir + " 2>/dev/null; " +
-      "[ -d " + dir + " ] && [ ! -L " + dir + " ]";
-    dirSetupProc.command = [root.binSh, "-c", script];
-    dirSetupProc.running = true;
-  }
 
   function persistPrefs() {
-    if (!root.prefsDirReady) {
-      root._prefsWritePending = true;
-      root.ensurePrefsDir();
-      return;
-    }
-    root.writePrefsNow();
-  }
-
-  function writePrefsNow() {
     // Never let a write failure bubble into a caller (e.g. connectCountry).
     try {
-      prefsWriter.setText(JSON.stringify({ favorites: favorites, recents: recents }));
+      var json = root.shQuote(JSON.stringify({ favorites: favorites, recents: recents }));
+      var script = [
+        "set -e",
+        "umask 077",
+        "base=\"$HOME/.local/state\"",
+        "mkdir -p \"$base\"",
+        "cd \"$base\"",
+        "name=omarchy-nordvpn",
+        "if [ -e \"$name\" ] && [ -L \"$name\" ]; then echo 'refusing symlinked state dir' >&2; exit 1; fi",
+        "mkdir \"$name\" 2>/dev/null || true",
+        // Re-check right before cd'ing in: mkdir's "already exists" failure
+        // is only benign if what already exists is still the real directory,
+        // not a symlink dropped in the instant between the check above and
+        // this mkdir attempt.
+        "[ -d \"$name\" ] && [ ! -L \"$name\" ]",
+        "cd \"$name\"",
+        "tmp=$(mktemp ./.prefs.XXXXXXXXXX)",
+        "printf %s " + json + " > \"$tmp\" && mv -T \"$tmp\" prefs.json"
+      ].join(" && ");
+      prefsWriteProc.command = [root.binSh, "-c", script];
+      prefsWriteProc.running = true;
     } catch (e) {
       console.warn("ayan.nordvpn: could not persist prefs", e);
     }
@@ -426,7 +464,6 @@ Panel {
     countriesFile.reload();
     worldFile.reload();
     cliProbe.running = true;
-    ensurePrefsDir();
     refreshStatus();
   }
 
@@ -440,13 +477,15 @@ Panel {
     command: [root.binNordvpn, "status"]
     clearEnvironment: true
     environment: root.minimalEnv
-    stdout: StdioCollector { id: statusOut; waitForEnd: true }
-    stderr: StdioCollector { id: statusErr; waitForEnd: true }
+    stdout: StdioCollector { id: statusOut; waitForEnd: false }
+    stderr: StdioCollector { id: statusErr; waitForEnd: false }
     onExited: function (code) {
       root.applyStatus((statusOut.text || "") + "\n" + (statusErr.text || ""), code === 0);
     }
   }
   ProcGuard { target: statusProc; termMs: 6000; killMs: 2000 }
+  OutputCap { target: statusOut; guarded: statusProc }
+  OutputCap { target: statusErr; guarded: statusProc }
 
   // `nordvpn status` never mentions login state (logged-out just reads
   // "Status: Disconnected") — `nordvpn account` is the one command that
@@ -456,21 +495,23 @@ Panel {
     command: [root.binNordvpn, "account"]
     clearEnvironment: true
     environment: root.minimalEnv
-    stdout: StdioCollector { id: accountOut; waitForEnd: true }
-    stderr: StdioCollector { id: accountErr; waitForEnd: true }
+    stdout: StdioCollector { id: accountOut; waitForEnd: false }
+    stderr: StdioCollector { id: accountErr; waitForEnd: false }
     onExited: {
       var raw = (accountOut.text || "") + (accountErr.text || "");
       root.loggedIn = !/not logged in/i.test(raw);
     }
   }
   ProcGuard { target: accountProc; termMs: 6000; killMs: 2000 }
+  OutputCap { target: accountOut; guarded: accountProc }
+  OutputCap { target: accountErr; guarded: accountProc }
 
   Process {
     id: actionProc
     clearEnvironment: true
     environment: root.minimalEnv
-    stdout: StdioCollector { id: actionOut; waitForEnd: true }
-    stderr: StdioCollector { id: actionErr; waitForEnd: true }
+    stdout: StdioCollector { id: actionOut; waitForEnd: false }
+    stderr: StdioCollector { id: actionErr; waitForEnd: false }
     onExited: function () {
       root.busy = false;
       root.busyLabel = "";
@@ -480,6 +521,8 @@ Panel {
     }
   }
   ProcGuard { target: actionProc; termMs: 20000; killMs: 3000 }
+  OutputCap { target: actionOut; guarded: actionProc }
+  OutputCap { target: actionErr; guarded: actionProc }
 
   Process {
     id: copyProc
@@ -497,32 +540,23 @@ Panel {
   }
   ProcGuard { target: cliProbe; termMs: 5000; killMs: 2000 }
 
-  // Validates/creates the private prefs directory (see ensurePrefsDir()).
+  // Validates the state directory and writes prefs.json in one shell
+  // invocation — see the comment on persistPrefs() for why the check and the
+  // write can't be split across separate steps/mechanisms.
   Process {
-    id: dirSetupProc
+    id: prefsWriteProc
     clearEnvironment: true
     environment: root.minimalEnv
+    stdout: StdioCollector { id: prefsWriteOut; waitForEnd: false }
+    stderr: StdioCollector { id: prefsWriteErr; waitForEnd: false }
     onExited: function (code) {
-      root.prefsDirReady = (code === 0);
-      if (code !== 0) {
-        console.warn("ayan.nordvpn: refusing to use prefs dir (symlinked or could not be created)");
-        root._prefsWritePending = false;
-      } else if (root._prefsWritePending) {
-        root._prefsWritePending = false;
-        root.writePrefsNow();
-      }
+      if (code !== 0)
+        console.warn("ayan.nordvpn: could not persist prefs", prefsWriteErr.text || prefsWriteOut.text || code);
     }
   }
-  ProcGuard { target: dirSetupProc; termMs: 5000; killMs: 2000 }
-
-  FileView {
-    id: prefsWriter
-    path: root.prefsPath
-    preload: false
-    printErrors: false
-    atomicWrites: true
-    onSaveFailed: function (err) { console.warn("ayan.nordvpn: could not persist prefs", err); }
-  }
+  ProcGuard { target: prefsWriteProc; termMs: 5000; killMs: 2000 }
+  OutputCap { target: prefsWriteOut; guarded: prefsWriteProc }
+  OutputCap { target: prefsWriteErr; guarded: prefsWriteProc }
 
   // Privileged/system one-off fixes for the setup flow (start the daemon
   // service, add the user to the `nordvpn` group). Separate from actionProc
@@ -532,8 +566,8 @@ Panel {
     id: setupProc
     clearEnvironment: true
     environment: root.sessionEnv
-    stdout: StdioCollector { id: setupOut; waitForEnd: true }
-    stderr: StdioCollector { id: setupErr; waitForEnd: true }
+    stdout: StdioCollector { id: setupOut; waitForEnd: false }
+    stderr: StdioCollector { id: setupErr; waitForEnd: false }
     onExited: function (code) {
       root.setupBusy = false;
       var text = (setupOut.text || "") + (setupErr.text || "");
@@ -547,20 +581,27 @@ Panel {
   // dialog, which can legitimately sit open for a while — give it much more
   // rope than a plain CLI call before treating it as wedged.
   ProcGuard { target: setupProc; termMs: 120000; killMs: 5000 }
+  OutputCap { target: setupOut; guarded: setupProc }
+  OutputCap { target: setupErr; guarded: setupProc }
 
   // `nordvpn login` prints "Continue in the browser: <url>" and then BLOCKS
   // until the browser round-trip completes (confirmed live: sometimes that's
   // ~1s, sometimes it sits for as long as the user takes in the browser) —
-  // so stdout is streamed line-by-line into handleLoginOutput() instead of
+  // so output is watched live via a non-waiting StdioCollector instead of
   // collected and read only at exit; otherwise the URL would never reach the
-  // UI while the process is still waiting. onExited is still the fallback
-  // for success/failure text once it does finally exit.
+  // UI while the process is still waiting. A line-splitting parser would
+  // buffer an entire record with no visible size until its delimiter showed
+  // up, which is exactly the "unterminated record" a hostile/wedged CLI could
+  // abuse; StdioCollector instead exposes (and grows) its `text` on every
+  // chunk regardless of line breaks, so handleLoginOutput/OutputCap see and
+  // cap it continuously. onExited is still the fallback for success/failure
+  // text once the process does finally exit.
   Process {
     id: loginProc
     clearEnvironment: true
     environment: root.minimalEnv
-    stdout: SplitParser { onRead: function (line) { root.handleLoginOutput(line, false); } }
-    stderr: SplitParser { onRead: function (line) { root.handleLoginOutput(line, true); } }
+    stdout: StdioCollector { id: loginStdout; waitForEnd: false }
+    stderr: StdioCollector { id: loginStderr; waitForEnd: false }
     onExited: function (code) {
       var text = root.loginOutputBuf;
       root.refreshStatus();
@@ -586,6 +627,10 @@ Panel {
   // The browser round-trip is user-paced; give it generous rope before
   // assuming the process itself (not just the human) is stuck.
   ProcGuard { target: loginProc; termMs: 300000; killMs: 5000 }
+  Connections { target: loginStdout; function onDataChanged() { root.handleLoginOutput(loginStdout.text, false); } }
+  Connections { target: loginStderr; function onDataChanged() { root.handleLoginOutput(loginStderr.text, true); } }
+  OutputCap { target: loginStdout; guarded: loginProc }
+  OutputCap { target: loginStderr; guarded: loginProc }
 
   // If no URL shows up at all within 12s (e.g. the daemon is unreachable, or
   // this version of the CLI changed its wording), stop looking like it's
@@ -628,13 +673,14 @@ Panel {
     id: pingProc
     clearEnvironment: true
     environment: root.minimalEnv
-    stdout: StdioCollector { id: pingOut; waitForEnd: true }
+    stdout: StdioCollector { id: pingOut; waitForEnd: false }
     onExited: function () {
       var m = String(pingOut.text || "").match(/time[=<]([\d.]+)\s*ms/i);
       root.latencyMs = m ? parseFloat(m[1]) : -1;
     }
   }
   ProcGuard { target: pingProc; termMs: 5000; killMs: 2000 }
+  OutputCap { target: pingOut; guarded: pingProc }
 
   // Poll cadence: relaxed when the panel is closed, snappier while it is open.
   Timer {
