@@ -134,7 +134,6 @@ Panel {
   // ------------------------------------------------------------- login ----
   property bool loginBusy: false
   property string loginStatusText: ""
-  property bool loginHelpOpen: false
   property string loginError: ""
   property string loginUrl: ""
   property bool loginUrlOpened: false
@@ -144,21 +143,6 @@ Panel {
   // grow unbounded even if the process is never terminated in time.
   property string _loginOutText: ""
   property string _loginErrText: ""
-
-  // A truly first-ever run of `nordvpn` on a machine (no prior config at
-  // all — verified live right after a fresh install) shows a one-time
-  // interactive analytics consent prompt ("(y/n)") before doing anything
-  // else, including login. With no TTY attached — as here — it just blocks
-  // forever with zero output, which looks exactly like "stuck, nothing
-  // happens". Piping "n" into stdin answers it (declining analytics, the
-  // more private default) and is a harmless no-op if the prompt doesn't
-  // come up (already answered on a prior run).
-  function runLogin(extraArgs) {
-    var argv = [root.binNordvpn, "login"].concat(extraArgs || []);
-    var quoted = argv.map(function (a) { return root.shQuote(a); }).join(" ");
-    loginProc.command = [root.binBash, "-c", "printf 'n\\n' | " + quoted];
-    loginProc.running = true;
-  }
 
   function startLogin() {
     if (loginProc.running) return;
@@ -170,37 +154,31 @@ Panel {
     root._loginErrText = "";
     loginStatusText = "Opening nordvpn.com in your browser…";
     loginBusy = true;
-    runLogin([]);
+    // A truly first-ever run of `nordvpn` on a machine (no prior config at
+    // all — verified live right after a fresh install) shows a one-time
+    // interactive analytics consent prompt ("(y/n)") before doing anything
+    // else, including login. With no TTY attached — as here — it just blocks
+    // forever with zero output, which looks exactly like "stuck, nothing
+    // happens". Piping "n" into stdin answers it (declining analytics, the
+    // more private default) and is a harmless no-op if the prompt doesn't
+    // come up (already answered on a prior run).
+    var quoted = [root.binNordvpn, "login"].map(function (a) { return root.shQuote(a); }).join(" ");
+    loginProc.command = [root.binBash, "-c", "printf 'n\\n' | " + quoted];
+    loginProc.running = true;
     loginUrlTimeoutTimer.restart();
   }
 
-  function submitCallback(url) {
-    url = String(url || "").trim();
-    if (!url) return;
-    loginError = "";
-    loginUrl = "";
-    loginUrlOpened = true;   // already have a URL — don't try to relaunch a browser for it
-    loginOutputBuf = "";
-    root._loginOutText = "";
-    root._loginErrText = "";
-    loginStatusText = "Completing login…";
-    loginBusy = true;
-    runLogin(["--callback", url]);
-  }
-
-  function submitToken(token) {
-    token = String(token || "").trim();
-    if (!token) return;
-    loginError = "";
-    loginUrl = "";
-    loginUrlOpened = true;
-    loginOutputBuf = "";
-    root._loginOutText = "";
-    root._loginErrText = "";
-    loginStatusText = "Logging in with token…";
-    loginBusy = true;
-    runLogin(["--token", token]);
-  }
+  // There is deliberately no manual "paste callback URL" / "paste token"
+  // fallback here. `nordvpn login --callback <url>` and `--token <token>`
+  // both take the credential as a plain argv element — the CLI's own
+  // non-interactive error text confirms it has no other input path
+  // ("provide the token as an argument using the 'nordvpn login --token
+  // <TOKEN>' command"), and Quickshell's Process has no way to allocate a
+  // pty for the interactive stdin prompt the CLI otherwise expects. Any
+  // argv-passed secret is readable by other processes on the host via
+  // /proc/<pid>/cmdline, so submitting a token/callback link this way would
+  // leak it — the browser-driven flow above is the only login path that
+  // keeps the credential out of a command line entirely.
 
   // `nordvpn login` prints its URL and then blocks — sometimes for as long as
   // the browser round-trip takes — so we can't wait for the process to exit
@@ -613,7 +591,7 @@ Panel {
         root.loginBusy = false;
         root.loginStatusText = "";
         root.loginUrl = "";
-        root.loginError = "Login didn't go through — try again, or use the manual options below.";
+        root.loginError = "Login didn't go through — try again.";
       } else if (!root.loginUrlOpened) {
         // Exited without ever printing a URL and without a clear error —
         // rely on the account poll to notice a login that did go through.
@@ -634,7 +612,7 @@ Panel {
 
   // If no URL shows up at all within 12s (e.g. the daemon is unreachable, or
   // this version of the CLI changed its wording), stop looking like it's
-  // silently working forever and point at the manual fallback instead.
+  // silently working forever.
   Timer {
     id: loginUrlTimeoutTimer
     interval: 12000
@@ -643,7 +621,7 @@ Panel {
       if (root.loginUrlOpened) return;
       root.loginBusy = false;
       root.loginStatusText = "";
-      root.loginError = "No login link showed up yet — try again, or use the manual options below.";
+      root.loginError = "No login link showed up yet — try again.";
     }
   }
 
@@ -664,7 +642,7 @@ Panel {
         running = false;
         root.loginBusy = false;
         root.loginStatusText = "";
-        root.loginError = "Still not logged in — paste the callback link below if the browser didn't bring you back.";
+        root.loginError = "Still not logged in — click \"Log in with browser\" again if the browser didn't bring you back.";
       }
     }
   }
@@ -1272,7 +1250,7 @@ Panel {
       }
     }
 
-    // ---- loggedout: browser login + manual fallback --------------------
+    // ---- loggedout: browser login ---------------------------------------
     Column {
       visible: setup.blocker === "loggedout"
       width: parent.width
@@ -1326,106 +1304,6 @@ Panel {
         font.family: Style.font.family
         font.pixelSize: Style.font.caption
       }
-
-      Text {
-        text: root.loginHelpOpen ? "▾ Trouble logging in?" : "▸ Trouble logging in?"
-        color: Qt.darker(Color.foreground, 1.3)
-        font.family: Style.font.family
-        font.pixelSize: Style.font.caption
-        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.loginHelpOpen = !root.loginHelpOpen }
-      }
-
-      Column {
-        visible: root.loginHelpOpen
-        width: parent.width
-        spacing: Style.space(10)
-
-        Column {
-          width: parent.width
-          spacing: Style.space(4)
-          Text {
-            text: "If the browser didn't bring you back, click the \"Continue\" button on the NordVPN page, copy its link, and paste it here:"
-            width: parent.width
-            wrapMode: Text.WordWrap
-            color: Qt.darker(Color.foreground, 1.6)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-          }
-          SetupInputRow {
-            placeholder: "https://…"
-            buttonText: "Submit"
-            onSubmitted: function (value) { root.submitCallback(value); }
-          }
-        }
-
-        Column {
-          width: parent.width
-          spacing: Style.space(4)
-          Text {
-            text: "Or log in with a token from your Nord Account dashboard (Set Up NordVPN manually):"
-            width: parent.width
-            wrapMode: Text.WordWrap
-            color: Qt.darker(Color.foreground, 1.6)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-          }
-          SetupInputRow {
-            placeholder: "access token"
-            buttonText: "Submit"
-            echoModePassword: true
-            onSubmitted: function (value) { root.submitToken(value); }
-          }
-        }
-      }
-    }
-  }
-
-  // A one-line text field + submit pill, used by the manual login fallbacks.
-  component SetupInputRow: Row {
-    id: inputRow
-    property string placeholder: ""
-    property string buttonText: "Submit"
-    property bool echoModePassword: false
-    signal submitted(string value)
-    width: parent.width
-    spacing: Style.space(8)
-
-    Rectangle {
-      width: parent.width - submitPill.width - inputRow.spacing
-      height: Style.spacing.controlHeight
-      radius: Style.cornerRadius
-      color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, 0.05)
-      border.width: 1
-      border.color: Qt.rgba(Color.foreground.r, Color.foreground.g, Color.foreground.b, field.activeFocus ? 0.4 : 0.15)
-
-      TextInput {
-        id: field
-        anchors.fill: parent
-        anchors.leftMargin: Style.space(10)
-        anchors.rightMargin: Style.space(10)
-        verticalAlignment: TextInput.AlignVCenter
-        clip: true
-        color: Color.foreground
-        font.family: Style.font.family
-        font.pixelSize: Style.font.body
-        echoMode: inputRow.echoModePassword ? TextInput.Password : TextInput.Normal
-        Keys.onReturnPressed: { inputRow.submitted(text); text = ""; }
-      }
-      Text {
-        anchors.left: parent.left
-        anchors.leftMargin: Style.space(10)
-        anchors.verticalCenter: parent.verticalCenter
-        visible: field.text === ""
-        text: inputRow.placeholder
-        color: Qt.darker(Color.foreground, 1.6)
-        font.family: Style.font.family
-        font.pixelSize: Style.font.body
-      }
-    }
-    PillButton {
-      id: submitPill
-      text: inputRow.buttonText
-      onClicked: { inputRow.submitted(field.text); field.text = ""; }
     }
   }
 

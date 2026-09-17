@@ -40,8 +40,7 @@ Omarchy theme, so it restyles itself whenever you run `omarchy theme set`.
   - The `nordvpnd` service not running → one button (`pkexec systemctl
     enable --now nordvpnd`).
   - Not logged in → **Log in with browser** (runs `nordvpn login`, which
-    opens your browser itself, then polls until it completes), with a
-    fallback to paste the callback link or an account token manually.
+    opens your browser itself, then polls until it completes).
 
 The panel is pinned to the widget's position when it opens, so it never
 drifts as the country name changes.
