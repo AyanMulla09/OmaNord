@@ -106,12 +106,18 @@ Panel {
   // not just asked to stop) so no further output is produced.
   readonly property int outputCapBytes: 65536
   component OutputCap: Connections {
-    id: cap
     property Process guarded
     property int capBytes: root.outputCapBytes
-    function onDataChanged() {
-      if (target && target.text && target.text.length > cap.capBytes && cap.guarded && cap.guarded.running)
-        cap.guarded.signal(9);
+    // Verified live: referencing this Connections' own `id` from inside its
+    // signal handler throws "ReferenceError: <id> is not defined" when the
+    // Connections is an inline `component` type instantiated elsewhere —
+    // true both for "onDataChanged: {...}" and "function onDataChanged()"
+    // forms. Unqualified access to `target` (built into Connections) and to
+    // this component's own properties works fine, so that's what's used
+    // here instead of a self-id prefix.
+    onDataChanged: {
+      if (target && target.text && target.text.length > capBytes && guarded && guarded.running)
+        guarded.signal(9);
     }
   }
   property string tab: "map"
@@ -605,8 +611,8 @@ Panel {
   // The browser round-trip is user-paced; give it generous rope before
   // assuming the process itself (not just the human) is stuck.
   ProcGuard { target: loginProc; termMs: 300000; killMs: 5000 }
-  Connections { target: loginStdout; function onDataChanged() { root.handleLoginOutput(loginStdout.text, false); } }
-  Connections { target: loginStderr; function onDataChanged() { root.handleLoginOutput(loginStderr.text, true); } }
+  Connections { target: loginStdout; onDataChanged: root.handleLoginOutput(loginStdout.text, false) }
+  Connections { target: loginStderr; onDataChanged: root.handleLoginOutput(loginStderr.text, true) }
   OutputCap { target: loginStdout; guarded: loginProc }
   OutputCap { target: loginStderr; guarded: loginProc }
 
