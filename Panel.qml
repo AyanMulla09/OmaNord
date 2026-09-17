@@ -286,8 +286,15 @@ Panel {
     toastTimer.restart();
   }
 
+  // Handed to wl-copy over stdin rather than embedded in a `sh -c "..."`
+  // script string: the latter would put the copied value (e.g. the live
+  // login URL) into that shell's own argv, readable by any other local
+  // process via /proc/<pid>/cmdline for as long as it runs — shQuote
+  // prevents injection but does nothing to prevent that exposure.
   function copyText(s) {
-    copyProc.command = [root.binSh, "-c", "printf '%s' " + shQuote(s) + " | " + root.binWlCopy];
+    copyProc.pendingText = String(s || "");
+    copyProc.command = [root.binWlCopy];
+    copyProc.stdinEnabled = true;
     copyProc.running = true;
     showToast("Copied to clipboard");
   }
@@ -447,6 +454,7 @@ Panel {
   Component.onCompleted: {
     countriesFile.reload();
     worldFile.reload();
+    reloadPrefsIfSafe();
     cliProbe.running = true;
     refreshStatus();
   }
@@ -510,8 +518,14 @@ Panel {
 
   Process {
     id: copyProc
+    property string pendingText: ""
     clearEnvironment: true
     environment: root.sessionEnv
+    onStarted: {
+      write(pendingText);
+      stdinEnabled = false;   // closes stdin so wl-copy sees EOF
+      pendingText = "";
+    }
   }
   ProcGuard { target: copyProc; termMs: 5000; killMs: 2000 }
 
@@ -702,10 +716,35 @@ Panel {
     }
   }
 
+  // Mirrors the write side's symlink check: a plain FileView read follows
+  // symlinks, so without this, swapping the state dir or prefs.json for a
+  // symlink would make the widget load and trust whatever that points at
+  // as "favorites"/"recents". preload is off so the very first load also
+  // goes through this check rather than firing automatically on `path` being
+  // set.
+  function reloadPrefsIfSafe() {
+    if (prefsCheckProc.running) return;
+    prefsCheckProc.command = [root.binSh, "-c",
+      "[ ! -L " + root.shQuote(root.prefsDir) + " ] && [ ! -L " + root.shQuote(root.prefsPath) + " ]"];
+    prefsCheckProc.running = true;
+  }
+
+  Process {
+    id: prefsCheckProc
+    clearEnvironment: true
+    environment: root.minimalEnv
+    onExited: function (code) {
+      if (code === 0) prefsFile.reload();
+      else console.warn("ayan.nordvpn: refusing to read prefs (symlinked path)");
+    }
+  }
+  ProcGuard { target: prefsCheckProc; termMs: 5000; killMs: 2000 }
+
   FileView {
     id: prefsFile
-    path: Quickshell.env("HOME") + "/.local/state/omarchy-nordvpn/prefs.json"
+    path: root.prefsPath
     watchChanges: true
+    preload: false
     printErrors: false
     onLoaded: {
       try {
@@ -714,7 +753,7 @@ Panel {
         root.recents = Array.isArray(d.recents) ? d.recents : [];
       } catch (e) { /* keep defaults */ }
     }
-    onFileChanged: reload()
+    onFileChanged: root.reloadPrefsIfSafe()
   }
 
   // ----------------------------------------------------- bar widget -------
